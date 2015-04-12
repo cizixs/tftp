@@ -1,18 +1,13 @@
 import sys
-import socket
 import struct
 import binascii
 import argparse
 
-MAXSIZE = 500
-PORT = 6699
-
-# Protocol type
-RRQ = 1
-WRQ = 2
-DATA = 3
-ACK = 4
-ERROR = 5
+import tftp
+from tftp import SocketBase
+from tftp import get_opcode
+from tftp import make_data_packet
+from tftp import make_ack_packet
 
 
 class State(object):
@@ -20,35 +15,28 @@ class State(object):
 
 
 # Make packet functions. 
-# Client only handles 4 packets.
-def make_request_packet(opcode, filename):
-    mode = 'octet'
+def make_request_packet(opcode, filename, mode='octet'):
     values = (opcode, filename, 0, mode, 0)
     s = struct.Struct('! H {}s B {}s B'.format(len(filename),len(mode)) )
     return s.pack(*values)
     
 def make_rrq_packet(filename):
-    return make_request_packet(RRQ, filename)
+    return make_request_packet(tftp.RRQ, filename)
 
 def make_wrq_packet(filename):
-    return make_request_packet(WRQ, filename)
-
-def make_data_packet(block_num, data):
-    return struct.pack('! H H', DATA, block_num) + data
-
-def make_ack_packet(block_num):
-    return struct.pack('!H H', ACK, block_num)
+    return make_request_packet(tftp.WRQ, filename)
 
 
-class TftpClient(object):
-    def __init__(self, host='127.0.0.1', port=PORT, filename=None, **argv):
+class TftpClient(SocketBase):
+    def __init__(self, host='127.0.0.1', port='', filename=None, **argv):
         self.host = host
-        self.port = port
-        self.block_size = 512
+        self.port = port or default_port()
         self.block_num = 1
         self.is_done = False
         self.status = State.START
-        self.action = 'get'
+        self.action = argv.get('action', 'get')
+        self.debug = argv.get('debug', False)
+        self.block_size = argv.get('block_size', tftp.DEFAULT_BLOCK_SIZE)
         self.filename = filename
         self.setup_file()
         self.setup_connect()
@@ -56,10 +44,6 @@ class TftpClient(object):
     @property
     def server_addr(self):
         return (self.host, self.port)
-
-    @property
-    def max_packet_size(self):
-        return self.block_size + 4
 
     def setup_file(self):
         if self.filename:
@@ -69,27 +53,6 @@ class TftpClient(object):
                 self.fd = open(self.filename, 'rb')
             else:
                 raise Exception('unsupport action %s' % self.action)
-
-    def setup_connect(self):
-        """Socket setup.
-        Because UDP is connectionless, just create a UDP socket.
-        """
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    def send_packet(self, packet):
-        """Send packet to remote server."""
-        self.sock.sendto(packet, self.server_addr)
-
-    def recv_packet(self):
-        """Receive packet from remote server.
-
-        By default, `sock.recvfrom` is blocking, which might cause 
-        performance problem. Use select to handle over CPU while waiting.
-
-        Also, if waiting timeout, return (None, None).
-        """
-        (packet, addr) = self.sock.recvfrom(self.max_packet_size)
-        return (packet, addr)
 
     def handle_packet(self, packet, addr):
         """Handle pakcet from remote.
@@ -106,13 +69,13 @@ class TftpClient(object):
 
         packet_len = len(packet)
 
-        opcode = struct.unpack('!H', packet[:2])[0]
-        if opcode == ERROR:
+        opcode = get_opcode(packet)
+        if opcode == tftp.ERROR:
             err_code = struct.unpack('!H', packet[2:4])[0]
             err_msg = packet[4:packet_len-1]
             print "Error %s: %s" % (err_code, err_msg)
             sys.exit(err_code)
-        elif opcode == DATA:
+        elif opcode == tftp.DATA:
             # This is a data packet received from server, save data to file.
 
             # update port
@@ -121,7 +84,8 @@ class TftpClient(object):
             block_num = struct.unpack('!H', packet[2:4])[0]
             if block_num != self.block_num:
                 # skip unexpected #block data packet 
-            	return
+                print 'unexpected block num %d' % block_num
+                return
             data = packet[4:]
             self.fd.write(data)
             if len(packet) < self.block_size + 2:
@@ -129,26 +93,34 @@ class TftpClient(object):
                 self.fd.close()
                 file_len = self.block_size * (self.block_num -1) + len(data)
                 print '%d bytes received.' % file_len 
-            ack_packet = make_ack_packet(self.block_num)
-            self.send_packet(ack_packet)
             self.block_num += 1
-        elif opcode == ACK:
+        elif opcode == tftp.ACK:
             # This is a write request ACK
-            raise NotImplementedError('Put action is not supported right now.')
+            # Send next block_size data to server
+            if self.port != port:
+                self.port = port
+            block_num = struct.unpack('!H', packet[2:4])[0]
+            self.verbose('received ack for %d' % block_num)
+            self.block_num += 1
         else:
             raise Exception('unrecognized packet: %s', str(opcode))
         
     def get_next_packet(self):
         if self.status == State.START:
-            opcode = RRQ if self.action == 'get' else WRQ
+            opcode = tftp.RRQ if self.action == 'get' else tftp.WRQ
+            self.verbose('about to send packet %d' % opcode)
             packet = make_request_packet(opcode, self.filename)
             self.status = State.DATA
         elif self.status == State.DATA:
             if self.action == 'get':
+                self.verbose('about to send ack for %d' % (self.block_num - 1))
                 packet = make_ack_packet(self.block_num-1)
             elif self.action == 'put':
+                self.verbose('about to send data for %d' % (self.block_num - 1))
                 data = self.fd.read(self.block_size)
-                packet = make_data_packet(self.block_num, data)
+                if len(data) < self.block_size:
+                    self.is_done = True
+                packet = make_data_packet(self.block_num-1, data)
 
         return packet
 
@@ -170,14 +142,19 @@ class TftpClient(object):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Argparser for tftp.')
-    parser.add_argument('-s', action='store', dest='host', 
+    parser = argparse.ArgumentParser(description='Tftp client in pure python.')
+    parser.add_argument('--host', '-s', action='store', dest='host', 
             default='127.0.0.1', help='Server hostname')
-    parser.add_argument('-p', action='store', dest='port', type=int,
+    parser.add_argument('--port', '-p', action='store', dest='port', type=int,
             default=69, help='Server port')
-    parser.add_argument('-f', action='store', dest='filename', 
+    parser.add_argument('--file', '-f', action='store', dest='filename', 
             default='test.txt', help='File to get from server')
-    result = parser.parse_args()
+    parser.add_argument('--debug', '-d', action='store_true',  
+            default=False, help='Debug mode: print more information(debug: False)')
+    parser.add_argument('action',  default='get', metavar='action',
+            help='Action to conduct: put or get(default: get)')
+    args = parser.parse_args()
 
-    tftp = TftpClient(result.host, result.port, result.filename)
-    tftp.handle()
+    tftp_client = TftpClient(args.host, args.port, args.filename,
+            action=args.action, debug=args.debug)
+    tftp_client.handle()
