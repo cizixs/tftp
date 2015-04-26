@@ -25,6 +25,9 @@ def make_ack_packet(block_num):
 def get_opcode(packet):
     return struct.unpack('!H', packet[:2])[0]
 
+def get_blocknum(packet):
+    return struct.unpack('!H', packet[2:4])[0]
+
 class SocketBase(object):
 
     @property

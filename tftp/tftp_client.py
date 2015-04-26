@@ -6,6 +6,7 @@ import argparse
 import tftp
 from tftp import SocketBase
 from tftp import get_opcode
+from tftp import default_port
 from tftp import make_data_packet
 from tftp import make_ack_packet
 
@@ -30,7 +31,7 @@ def make_wrq_packet(filename):
 class TftpClient(SocketBase):
     def __init__(self, host='127.0.0.1', port='', filename=None, **argv):
         self.host = host
-        self.port = port or default_port()
+        self.orig_port = self.port = port or default_port()
         self.block_num = 1
         self.is_done = False
         self.status = State.START
@@ -38,6 +39,14 @@ class TftpClient(SocketBase):
         self.debug = argv.get('debug', False)
         self.block_size = argv.get('block_size', tftp.DEFAULT_BLOCK_SIZE)
         self.filename = filename
+        self.setup_file()
+        self.setup_connect()
+
+    def reset(self):
+        self.block_num = 1
+        self.is_done = False
+        self.status = State.START
+        self.port = self.orig_port or 69
         self.setup_file()
         self.setup_connect()
 
@@ -140,6 +149,67 @@ class TftpClient(SocketBase):
             (packet, addr) = self.recv_packet()
             self.handle_packet(packet, addr)
 
+def main():
+
+    menu = """Tftp client help menu:
+
+    Supported commands:
+
+    connect         connect to a server
+    get             get file
+    put             put file
+    quit            exit
+    ?               print this menu
+    """
+    def command_parse(line):
+        if not line:
+        	return (None, None)
+        
+        line = line.split()
+        command = line[0]
+        options = line[1:]
+        return command, options
+
+    tftp_client = TftpClient()
+
+    def connect(*args):
+        tftp_client.host = args[0]
+        if len(args) > 1:
+            tftp_client.port = int(args[1])
+            
+    def get(*args):
+        print args[0]
+        tftp_client.action = 'get'
+        tftp_client.filename = args[0]
+        tftp_client.reset()
+        tftp_client.handle()
+
+    def put(*args):
+        tftp_client.filename = args[0]
+        tftp_client.action = 'put'
+        tftp_client.reset()
+        tftp_client.handle()
+
+    def quit(*args):
+        print 'Bye!'
+
+    def print_help(*args):
+        print menu
+
+    command_map = {
+    	'connect': connect,
+        'get': get,
+        'put': put,
+        'quit': quit,
+    }
+
+    print 'Welcome to python tftpclient.'
+    while True:
+    	line = raw_input('tftp> ').strip().lower()
+    	command, options = command_parse(line)
+    	command_map.get(command, print_help)(*options)
+        if command == 'quit':
+        	break
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Tftp client in pure python.')
@@ -148,13 +218,18 @@ if __name__ == "__main__":
     parser.add_argument('--port', '-p', action='store', dest='port', type=int,
             default=69, help='Server port')
     parser.add_argument('--file', '-f', action='store', dest='filename', 
-            default='test.txt', help='File to get from server')
+            help='File to get from server')
     parser.add_argument('--debug', '-d', action='store_true',  
             default=False, help='Debug mode: print more information(debug: False)')
-    parser.add_argument('action',  default='get', metavar='action',
+    parser.add_argument('action',  metavar='action', nargs='*',
             help='Action to conduct: put or get(default: get)')
     args = parser.parse_args()
 
-    tftp_client = TftpClient(args.host, args.port, args.filename,
-            action=args.action, debug=args.debug)
-    tftp_client.handle()
+
+    print args
+    if not args.filename or not args.action:
+    	main()
+    else:
+        tftp_client = TftpClient(args.host, args.port, args.filename,
+                action=args.action[0], debug=args.debug)
+        tftp_client.handle()
